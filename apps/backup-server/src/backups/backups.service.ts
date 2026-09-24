@@ -3,6 +3,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  PayloadTooLargeException,
 } from '@nestjs/common';
 import { createHash, randomUUID } from 'crypto';
 import { unwrapDataKey } from '../crypto/decrypt-backup.util';
@@ -47,6 +48,8 @@ export class BackupsService {
     const authTagB64 = this.requiredHeader(req, 'x-auth-tag');
     const encryptedDataKeyB64 = this.requiredHeader(req, 'x-encrypted-data-key');
     const declaredSha = this.requiredHeader(req, 'x-ciphertext-sha256');
+    const maxBytes = this.maxUploadBytes();
+    this.assertContentLength(req, maxBytes);
 
     const backupId = this.newBackupId();
     const dir = join(this.storageDir, agentId, backupId);
@@ -63,16 +66,47 @@ export class BackupsService {
     try {
       await new Promise<void>((resolve, reject) => {
         const out = createWriteStream(payloadPath);
+        let settled = false;
+
+        const fail = (err: unknown) => {
+          if (settled) return;
+          settled = true;
+          req.pause();
+          out.destroy();
+          reject(err);
+        };
 
         req.on('data', (chunk: Buffer) => {
+          if (settled) return;
           sizeBytes += chunk.length;
+          if (sizeBytes > maxBytes) {
+            fail(
+              new PayloadTooLargeException(
+                `Upload exceeds ${maxBytes} bytes`,
+              ),
+            );
+            return;
+          }
           hash.update(chunk);
+          if (!out.write(chunk)) {
+            req.pause();
+            out.once('drain', () => {
+              if (!settled) req.resume();
+            });
+          }
         });
-        req.on('error', reject);
-        out.on('error', reject);
-        out.on('finish', resolve);
+        req.on('end', () => {
+          if (!settled) out.end();
+        });
+        req.on('error', fail);
+        out.on('error', fail);
+        out.on('finish', () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        });
 
-        req.pipe(out);
+        req.resume();
       });
 
       const ciphertextSha256Hex = hash.digest('hex');
@@ -150,6 +184,21 @@ export class BackupsService {
 
     const dataKey = unwrapDataKey(meta, privateKey);
     return { dataKeyB64: dataKey.toString('base64') };
+  }
+
+  private maxUploadBytes(): number {
+    const raw = Number(process.env.BACKUP_MAX_UPLOAD_BYTES);
+    if (!Number.isFinite(raw) || raw <= 0) return 512 * 1024 * 1024;
+    return raw;
+  }
+
+  private assertContentLength(req: Request, maxBytes: number): void {
+    const raw = req.headers['content-length'];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    if (value === undefined) return;
+    const declared = Number(value);
+    if (!Number.isFinite(declared) || declared <= maxBytes) return;
+    throw new PayloadTooLargeException(`Upload exceeds ${maxBytes} bytes`);
   }
 
   private requiredHeader(req: Request, name: string): string {
