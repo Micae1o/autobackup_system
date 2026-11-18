@@ -178,29 +178,41 @@ async function decryptAll(opts: CliOptions): Promise<void> {
   console.log(`Done. Decrypted ${count} backup(s) into ${exportsDir()}`);
 }
 
-async function main(): Promise<void> {
-  const opts = parseArgs(process.argv.slice(2));
+export async function runCli(argv: string[]): Promise<number> {
+  const opts = parseArgs(argv);
 
   if (opts.dir) {
     await decryptOne(opts.dir, opts);
-    return;
+    return 0;
   }
 
   if (opts.all) {
     await decryptAll(opts);
-    return;
+    return 0;
   }
 
   if (!opts.backupId) {
     printHelp();
-    process.exit(1);
+    return 1;
   }
 
   const backupDir = await findBackupDir(opts.backupId, opts.agentId);
   await decryptOne(backupDir, opts);
+  return 0;
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+function isDirectRun(): boolean {
+  const entry = (process.argv[1] ?? '').replace(/\\/g, '/');
+  return entry.endsWith('/decrypt-backup.ts') || entry.endsWith('/decrypt-backup.js');
+}
+
+if (isDirectRun()) {
+  runCli(process.argv.slice(2))
+    .then((code) => {
+      if (code !== 0) process.exit(code);
+    })
+    .catch((err) => {
+      console.error(err instanceof Error ? err.message : err);
+      process.exit(1);
+    });
+}
